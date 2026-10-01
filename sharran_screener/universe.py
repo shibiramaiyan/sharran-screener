@@ -12,16 +12,20 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import time
 from pathlib import Path
 
 import pandas as pd
 import requests
+import yfinance as yf
+from yfinance import EquityQuery
 
 log = logging.getLogger(__name__)
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 UNIVERSE_CSV = CACHE_DIR / "universe.csv"
+UNIVERSE_RRSP_CSV = CACHE_DIR / "universe_rrsp.csv"
 CACHE_TTL_SEC = 24 * 3600
 
 XIC_URL = (
@@ -144,27 +148,110 @@ def fetch_tsx_composite() -> list[str]:
     return [_yahoo_symbol(t, "CA") for t in FALLBACK_CA]
 
 
-def load_universe(force_refresh: bool = False) -> pd.DataFrame:
-    """Return DataFrame[ticker, market, source] for US + CA universes."""
-    if not force_refresh and UNIVERSE_CSV.exists():
-        age = time.time() - UNIVERSE_CSV.stat().st_mtime
+def load_universe(force_refresh: bool = False,
+                  rrsp: bool = False) -> pd.DataFrame:
+    """Return DataFrame[ticker, market, source] for US + CA universes.
+
+    rrsp=True returns every common equity on CRA-designated exchanges
+    (NYSE/NASDAQ/NYSE American + TSX/TSXV) that clears a minimal
+    investability floor - i.e. everything RRSP-valid the model can
+    reasonably score.
+    """
+    csv = UNIVERSE_RRSP_CSV if rrsp else UNIVERSE_CSV
+    if not force_refresh and csv.exists():
+        age = time.time() - csv.stat().st_mtime
         if age < CACHE_TTL_SEC:
-            return pd.read_csv(UNIVERSE_CSV)
+            return pd.read_csv(csv)
 
-    try:
-        us = fetch_us_universe()
-    except Exception as e:  # noqa: BLE001
-        log.warning("US universe fetch failed (%s); using fallback list", e)
-        us = FALLBACK_US
-
-    ca = fetch_tsx_composite()
+    if rrsp:
+        try:
+            us = fetch_rrsp_market("US")
+            ca = fetch_rrsp_market("CA")
+            if len(us) < 1000 or len(ca) < 100:
+                raise ValueError(
+                    f"screener too short: {len(us)} US / {len(ca)} CA")
+        except Exception as e:  # noqa: BLE001 - fall back to index universe
+            log.warning("RRSP universe failed (%s); using index universe", e)
+            df = load_universe(force_refresh, rrsp=False)
+            df["source"] = df["source"] + " (index fallback)"
+            return df
+        source = {"US": "NYSE/NASDAQ/AMEX", "CA": "TSX/TSXV"}
+    else:
+        try:
+            us = fetch_us_universe()
+        except Exception as e:  # noqa: BLE001
+            log.warning("US universe fetch failed (%s); using fallback list", e)
+            us = FALLBACK_US
+        ca = fetch_tsx_composite()
+        source = {"US": "S&P 500+400", "CA": "TSX Composite"}
 
     df = pd.DataFrame(
         [(t, "US") for t in us] + [(t, "CA") for t in ca],
         columns=["ticker", "market"],
     ).drop_duplicates("ticker")
-    df["source"] = df["market"].map(
-        {"US": "S&P 500+400", "CA": "TSX Composite"})
+    df["source"] = df["market"].map(source)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_csv(UNIVERSE_CSV, index=False)
+    df.to_csv(csv, index=False)
     return df
+
+
+# ---------------------------------------------------------------------------
+# RRSP-wide universe: every common equity on CRA designated exchanges.
+# Yahoo's equity screener is paginated 250/page and returns marketCap,
+# avg volume and quoteType inline, so junk is dropped before the
+# (expensive) history download.
+# ---------------------------------------------------------------------------
+
+_RRSP_EXCHANGES = {"US": ["NYQ", "NMS", "ASE"], "CA": ["TOR", "VAN"]}
+_BAD_NAME = re.compile(
+    r"(?i)(warrant|preferred|preference|autocallable|debenture|"
+    r"subordinated|notes? due|structured|rate reset|etn\b|etf\b)")
+# -P* preferreds, -WT/-WS warrants, -R rights, -U units (US only - on the TSX
+# -UN is a REIT unit worth keeping and -U a USD-settled line).
+_BAD_SYM_US = re.compile(r"-(P[A-Z]*|W[TS]?|R|U)$")
+_BAD_SYM_CA = re.compile(r"-(P[A-Z]*|W[TS]?|R)\.TO$")
+RRSP_MIN_MCAP = 50e6          # sub-$50M names can't carry the model's math
+RRSP_MIN_DOLLAR_VOL = 250e3   # ~$250K/day; the model's own floor is stricter
+
+
+def _rrsp_page(exchanges: list[str], offset: int) -> dict:
+    for attempt in (0, 1):
+        try:
+            return yf.screen(
+                EquityQuery("is-in", ["exchange", *exchanges]),
+                size=250, offset=offset) or {}
+        except Exception as e:  # noqa: BLE001
+            if attempt:
+                log.warning("screener page @%d failed: %s", offset, e)
+                return {}
+            time.sleep(5)
+    return {}
+
+
+def fetch_rrsp_market(market: str) -> list[str]:
+    """All investable common equities/ADRs/REITs on one country's exchanges."""
+    bad_sym = _BAD_SYM_CA if market == "CA" else _BAD_SYM_US
+    out, offset, total = [], 0, 1
+    while offset < total:
+        resp = _rrsp_page(_RRSP_EXCHANGES[market], offset)
+        quotes = resp.get("quotes") or []
+        total = resp.get("total") or 0
+        if not quotes:
+            break
+        for q in quotes:
+            sym = q.get("symbol") or ""
+            name = q.get("longName") or q.get("shortName") or ""
+            if q.get("quoteType") != "EQUITY" or not sym:
+                continue
+            if _BAD_NAME.search(name) or bad_sym.search(sym):
+                continue
+            if (q.get("marketCap") or 0) < RRSP_MIN_MCAP:
+                continue
+            dv = (q.get("averageDailyVolume3Month") or 0) * \
+                (q.get("regularMarketPrice") or 0)
+            if dv < RRSP_MIN_DOLLAR_VOL:
+                continue
+            out.append(sym)
+        offset += len(quotes)
+        time.sleep(0.4)
+    return out

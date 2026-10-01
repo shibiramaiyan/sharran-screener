@@ -60,24 +60,26 @@ quarterly tax-loss harvest.
 """
 
 
-def screen_cache_path() -> Path:
-    return CACHE_DIR / f"screen_{date.today().isoformat()}.pkl"
+def screen_cache_path(rrsp: bool = False) -> Path:
+    uni_tag = "_rrsp" if rrsp else ""
+    return CACHE_DIR / f"screen_{date.today().isoformat()}{uni_tag}.pkl"
 
 
 @st.cache_data(show_spinner="Loading index constituents...", ttl=3600)
-def get_universe(force: bool) -> pd.DataFrame:
-    return load_universe(force_refresh=force)
+def get_universe(force: bool, rrsp: bool) -> pd.DataFrame:
+    return load_universe(force_refresh=force, rrsp=rrsp)
 
 
-def run_screen(force: bool, min_xray: float) -> tuple[list[model.Pick], dict]:
-    cache_file = screen_cache_path()
+def run_screen(force: bool, min_xray: float,
+               rrsp: bool = False) -> tuple[list[model.Pick], dict]:
+    cache_file = screen_cache_path(rrsp)
     if not force and cache_file.exists():
         with cache_file.open("rb") as f:
             payload = pickle.load(f)
         picks = [p for p in payload["picks"] if p.xray >= min_xray]
         return picks, payload["meta"]
 
-    uni = get_universe(force)
+    uni = get_universe(force, rrsp)
     tickers = uni["ticker"].tolist()
     market_map = dict(zip(uni["ticker"], uni["market"]))
 
@@ -159,6 +161,11 @@ with st.sidebar:
     portfolio = st.number_input("Portfolio value ($)", min_value=0.0,
                                 value=100000.0, step=10000.0)
     mkt = st.radio("Market", ["Both", "US", "CA"], horizontal=True)
+    uni_mode = st.selectbox(
+        "Universe",
+        ["All RRSP-eligible (TSX/TSXV + NYSE/NASDAQ/AMEX)",
+         "Index only (S&P 500/400 + TSX Composite - faster)"])
+    rrsp = uni_mode.startswith("All")
     min_xray = st.slider("Min X-Ray quality", 0, 100, 50)
     st.divider()
     st.markdown(
@@ -183,7 +190,7 @@ with st.sidebar:
 # Main
 # ---------------------------------------------------------------------------
 
-cache_file = screen_cache_path()
+cache_file = screen_cache_path(rrsp)
 picks, meta = [], {}
 if cache_file.exists() and not run and not force:
     with cache_file.open("rb") as f:
@@ -191,7 +198,7 @@ if cache_file.exists() and not run and not force:
     picks, meta = payload["picks"], payload["meta"]
     picks = [p for p in picks if p.xray >= min_xray]
 elif run:
-    picks, meta = run_screen(force, min_xray)
+    picks, meta = run_screen(force, min_xray, rrsp)
 
 if mkt != "Both":
     picks = [p for p in picks if p.market == mkt]

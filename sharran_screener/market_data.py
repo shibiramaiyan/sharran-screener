@@ -70,10 +70,11 @@ def _save_cache(kind: str, obj) -> None:
         pickle.dump(obj, f)
 
 
-def _download_chunk(tickers: list[str]) -> pd.DataFrame:
+def _download_chunk(tickers: list[str],
+                    period: str = HIST_PERIOD) -> pd.DataFrame:
     return yf.download(
         tickers,
-        period=HIST_PERIOD,
+        period=period,
         auto_adjust=True,
         group_by="ticker",
         threads=True,
@@ -82,25 +83,19 @@ def _download_chunk(tickers: list[str]) -> pd.DataFrame:
     )
 
 
-def download_history(tickers: list[str], force: bool = False) -> dict[str, pd.DataFrame]:
-    """Return {ticker: OHLCV DataFrame}. Cached per calendar day."""
-    if not force:
-        cached = _load_cache("history")
-        if cached is not None:
-            return cached
-
+def _bulk_download(syms: list[str], period: str = HIST_PERIOD,
+                   min_rows: int = 60) -> dict[str, pd.DataFrame]:
+    """Chunked yf.download with retry sweep. Returns {ticker: OHLCV}."""
     frames: dict[str, pd.DataFrame] = {}
-    bench_syms = list(BENCH.values())
-    all_syms = list(dict.fromkeys(bench_syms + tickers))
-    for i in range(0, len(all_syms), CHUNK):
-        chunk = all_syms[i : i + CHUNK]
+    for i in range(0, len(syms), CHUNK):
+        chunk = syms[i : i + CHUNK]
         try:
-            raw = _download_chunk(chunk)
+            raw = _download_chunk(chunk, period)
         except Exception as e:  # noqa: BLE001 - retry the chunk once
             log.warning("chunk download failed (%s); retrying once", e)
             time.sleep(5)
             try:
-                raw = _download_chunk(chunk)
+                raw = _download_chunk(chunk, period)
             except Exception as e2:  # noqa: BLE001
                 log.warning("chunk retry failed: %s", e2)
                 continue
@@ -114,20 +109,21 @@ def download_history(tickers: list[str], force: bool = False) -> dict[str, pd.Da
                     df = raw[sym].dropna(how="all")
                 else:  # single ticker came back flat
                     df = raw.dropna(how="all")
-                if len(df) >= 60 and df["Close"].dropna().size >= 60:
+                if len(df) >= min_rows and \
+                        df["Close"].dropna().size >= min_rows:
                     frames[sym] = df
             except Exception:  # noqa: BLE001 - skip malformed tickers
                 continue
         time.sleep(2.5)  # stay under Yahoo's burst limit
 
     # sweep pass: retry the bulk-dropped names chunked, then individually
-    missing = [s for s in all_syms if s not in frames]
+    missing = [s for s in syms if s not in frames]
     if missing:
         log.info("retrying %d dropped tickers", len(missing))
         for i in range(0, len(missing), 50):
             chunk = missing[i : i + 50]
             try:
-                raw = _download_chunk(chunk)
+                raw = _download_chunk(chunk, period)
                 if not raw.empty:
                     for sym in chunk:
                         try:
@@ -136,30 +132,94 @@ def download_history(tickers: list[str], force: bool = False) -> dict[str, pd.Da
                                 df = raw[sym].dropna(how="all")
                             else:
                                 continue
-                            if len(df) >= 60:
+                            if len(df) >= min_rows:
                                 frames[sym] = df
                         except Exception:  # noqa: BLE001
                             continue
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(2.5)
-    missing = [s for s in all_syms if s not in frames]
+    missing = [s for s in syms if s not in frames]
     for s in missing:
-        df = download_one(s)
-        if df is not None:
+        df = download_one(s, period=period)
+        if df is not None and len(df) >= min_rows:
             frames[s] = df
         time.sleep(0.3)
+    return frames
+
+
+def _latest_history_file() -> Path | None:
+    """Most recent history cache older than today, for incremental updates."""
+    files = sorted(CACHE_DIR.glob("history_*.pkl"))
+    for p in reversed(files):
+        if p.name != f"history_{_today()}.pkl":
+            return p
+    return None
+
+
+def _merge_history(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    merged = pd.concat([old, new])
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    return merged.tail(400)  # ~18 months of daily bars is plenty for techs
+
+
+def download_history(tickers: list[str],
+                     force: bool = False) -> dict[str, pd.DataFrame]:
+    """Return {ticker: OHLCV DataFrame}. Cached per calendar day.
+
+    If yesterday's cache exists and covers this universe, only the last
+    ~3 weeks are downloaded and merged - what makes a ~4k-ticker
+    RRSP-wide universe feasible to refresh daily.
+    """
+    if not force:
+        cached = _load_cache("history")
+        if cached is not None:
+            return cached
+
+    bench_syms = list(BENCH.values())
+    all_syms = list(dict.fromkeys(bench_syms + tickers))
+
+    prev: dict[str, pd.DataFrame] = {}
+    prev_file = _latest_history_file()
+    if prev_file is not None:
+        try:
+            with prev_file.open("rb") as f:
+                prev = pickle.load(f)
+        except Exception as e:  # noqa: BLE001
+            log.warning("prior history cache unreadable: %s", e)
+    coverage = len(set(tickers) & set(prev)) / max(len(tickers), 1)
+
+    if prev and coverage >= 0.8:
+        log.info("incremental refresh: %d tickers over cached history",
+                 len(all_syms))
+        fresh = _bulk_download(all_syms, period="20d", min_rows=1)
+        frames = {}
+        for sym in all_syms:
+            old = prev.get(sym)
+            new = fresh.get(sym)
+            if old is None:
+                continue  # new names need a full fetch below
+            df = _merge_history(old, new) if new is not None else old
+            if len(df) >= 60 and df["Close"].dropna().size >= 60:
+                frames[sym] = df
+        newbies = [s for s in all_syms if s not in prev]
+        if newbies:
+            log.info("full history for %d new tickers", len(newbies))
+            frames.update(_bulk_download(newbies))
+    else:
+        frames = _bulk_download(all_syms)
 
     if frames:
         _save_cache("history", frames)
     return frames
 
 
-def download_one(sym: str, session=None) -> pd.DataFrame | None:
+def download_one(sym: str, session=None,
+                 period: str = HIST_PERIOD) -> pd.DataFrame | None:
     """Single-ticker history; bypasses the daily cache."""
     try:
         df = yf.download(
-            sym, period=HIST_PERIOD, auto_adjust=True,
+            sym, period=period, auto_adjust=True,
             progress=False, session=session or SESSION,
         )
     except Exception:  # noqa: BLE001
@@ -169,7 +229,7 @@ def download_one(sym: str, session=None) -> pd.DataFrame | None:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.dropna(how="all")
-    return df if len(df) >= 60 else None
+    return df if len(df) >= (60 if period == HIST_PERIOD else 1) else None
 
 
 _FUND_FIELDS = [
