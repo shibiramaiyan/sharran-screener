@@ -171,13 +171,23 @@ def download_history(tickers: list[str],
     ~3 weeks are downloaded and merged - what makes a ~4k-ticker
     RRSP-wide universe feasible to refresh daily.
     """
+    bench_syms = list(BENCH.values())
+    all_syms = list(dict.fromkeys(bench_syms + tickers))
+
     if not force:
         cached = _load_cache("history")
         if cached is not None:
-            return cached
-
-    bench_syms = list(BENCH.values())
-    all_syms = list(dict.fromkeys(bench_syms + tickers))
+            missing = [s for s in all_syms if s not in cached]
+            if not missing:
+                return cached
+            # Same-day cache exists but under-covers this universe (e.g.
+            # switching to the wider RRSP universe) - top up the gap.
+            log.info("history cache covers %d/%d tickers; fetching %d "
+                     "missing", len(cached), len(all_syms), len(missing))
+            frames = dict(cached)
+            frames.update(_bulk_download(missing))
+            _save_cache("history", frames)
+            return frames
 
     prev: dict[str, pd.DataFrame] = {}
     prev_file = _latest_history_file()
