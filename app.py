@@ -60,26 +60,27 @@ quarterly tax-loss harvest.
 """
 
 
-def screen_cache_path(rrsp: bool = False) -> Path:
-    uni_tag = "_rrsp" if rrsp else ""
+def screen_cache_path(uni_tag: str = "") -> Path:
     return CACHE_DIR / f"screen_{date.today().isoformat()}{uni_tag}.pkl"
 
 
 @st.cache_data(show_spinner="Loading index constituents...", ttl=3600)
-def get_universe(force: bool, rrsp: bool) -> pd.DataFrame:
-    return load_universe(force_refresh=force, rrsp=rrsp)
+def get_universe(force: bool, rrsp: bool, india: bool) -> pd.DataFrame:
+    return load_universe(force_refresh=force, rrsp=rrsp, india=india)
 
 
 def run_screen(force: bool, min_xray: float,
-               rrsp: bool = False) -> tuple[list[model.Pick], dict]:
-    cache_file = screen_cache_path(rrsp)
+               rrsp: bool = False,
+               india: bool = False) -> tuple[list[model.Pick], dict]:
+    uni_tag = "_wide" if india else "_rrsp" if rrsp else ""
+    cache_file = screen_cache_path(uni_tag)
     if not force and cache_file.exists():
         with cache_file.open("rb") as f:
             payload = pickle.load(f)
         picks = [p for p in payload["picks"] if p.xray >= min_xray]
         return picks, payload["meta"]
 
-    uni = get_universe(force, rrsp)
+    uni = get_universe(force, rrsp, india)
     tickers = uni["ticker"].tolist()
     market_map = dict(zip(uni["ticker"], uni["market"]))
 
@@ -160,12 +161,14 @@ with st.sidebar:
 
     portfolio = st.number_input("Portfolio value ($)", min_value=0.0,
                                 value=100000.0, step=10000.0)
-    mkt = st.radio("Market", ["Both", "US", "CA"], horizontal=True)
+    mkt = st.radio("Market", ["Both", "US", "CA", "IN"], horizontal=True)
     uni_mode = st.selectbox(
         "Universe",
         ["All RRSP-eligible (TSX/TSXV + NYSE/NASDAQ/AMEX)",
+         "US + Canada + India NSE - widest",
          "Index only (S&P 500/400 + TSX Composite - faster)"])
-    rrsp = uni_mode.startswith("All")
+    india = uni_mode.startswith("US + Canada + India")
+    rrsp = uni_mode.startswith("All") or india
     min_xray = st.slider("Min X-Ray quality", 0, 100, 50)
     st.divider()
     st.markdown(
@@ -190,7 +193,8 @@ with st.sidebar:
 # Main
 # ---------------------------------------------------------------------------
 
-cache_file = screen_cache_path(rrsp)
+uni_tag = "_wide" if india else "_rrsp" if rrsp else ""
+cache_file = screen_cache_path(uni_tag)
 picks, meta = [], {}
 if cache_file.exists() and not run and not force:
     with cache_file.open("rb") as f:
@@ -198,7 +202,7 @@ if cache_file.exists() and not run and not force:
     picks, meta = payload["picks"], payload["meta"]
     picks = [p for p in picks if p.xray >= min_xray]
 elif run:
-    picks, meta = run_screen(force, min_xray, rrsp)
+    picks, meta = run_screen(force, min_xray, rrsp, india)
 
 if mkt != "Both":
     picks = [p for p in picks if p.market == mkt]

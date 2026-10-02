@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 UNIVERSE_CSV = CACHE_DIR / "universe.csv"
 UNIVERSE_RRSP_CSV = CACHE_DIR / "universe_rrsp.csv"
+UNIVERSE_WIDE_CSV = CACHE_DIR / "universe_wide.csv"
 CACHE_TTL_SEC = 24 * 3600
 
 XIC_URL = (
@@ -149,33 +150,43 @@ def fetch_tsx_composite() -> list[str]:
 
 
 def load_universe(force_refresh: bool = False,
-                  rrsp: bool = False) -> pd.DataFrame:
-    """Return DataFrame[ticker, market, source] for US + CA universes.
+                  rrsp: bool = False,
+                  india: bool = False) -> pd.DataFrame:
+    """Return DataFrame[ticker, market, source] for the chosen universe.
 
     rrsp=True returns every common equity on CRA-designated exchanges
     (NYSE/NASDAQ/NYSE American + TSX/TSXV) that clears a minimal
     investability floor - i.e. everything RRSP-valid the model can
-    reasonably score.
+    reasonably score. india=True additionally sweeps the NSE (not
+    RRSP-eligible - India is not a CRA designated exchange - but
+    screenable for non-registered research).
     """
-    csv = UNIVERSE_RRSP_CSV if rrsp else UNIVERSE_CSV
+    csv = (UNIVERSE_WIDE_CSV if india else
+           UNIVERSE_RRSP_CSV if rrsp else UNIVERSE_CSV)
     if not force_refresh and csv.exists():
         age = time.time() - csv.stat().st_mtime
         if age < CACHE_TTL_SEC:
             return pd.read_csv(csv)
 
-    if rrsp:
+    if rrsp or india:
+        markets = ["US", "CA"] + (["IN"] if india else [])
         try:
-            us = fetch_rrsp_market("US")
-            ca = fetch_rrsp_market("CA")
-            if len(us) < 1000 or len(ca) < 100:
+            lists = {m: fetch_rrsp_market(m) for m in markets}
+            if len(lists["US"]) < 1000 or len(lists["CA"]) < 100 or (
+                    india and len(lists["IN"]) < 500):
                 raise ValueError(
-                    f"screener too short: {len(us)} US / {len(ca)} CA")
+                    "screener too short: "
+                    + str({m: len(v) for m, v in lists.items()}))
         except Exception as e:  # noqa: BLE001 - fall back to index universe
-            log.warning("RRSP universe failed (%s); using index universe", e)
-            df = load_universe(force_refresh, rrsp=False)
+            log.warning("wide universe failed (%s); using index universe", e)
+            df = load_universe(force_refresh)
             df["source"] = df["source"] + " (index fallback)"
             return df
-        source = {"US": "NYSE/NASDAQ/AMEX", "CA": "TSX/TSXV"}
+        source = {"US": "NYSE/NASDAQ/AMEX", "CA": "TSX/TSXV", "IN": "NSE"}
+        df = pd.DataFrame(
+            [(t, m) for m, lst in lists.items() for t in lst],
+            columns=["ticker", "market"],
+        ).drop_duplicates("ticker")
     else:
         try:
             us = fetch_us_universe()
@@ -184,11 +195,10 @@ def load_universe(force_refresh: bool = False,
             us = FALLBACK_US
         ca = fetch_tsx_composite()
         source = {"US": "S&P 500+400", "CA": "TSX Composite"}
-
-    df = pd.DataFrame(
-        [(t, "US") for t in us] + [(t, "CA") for t in ca],
-        columns=["ticker", "market"],
-    ).drop_duplicates("ticker")
+        df = pd.DataFrame(
+            [(t, "US") for t in us] + [(t, "CA") for t in ca],
+            columns=["ticker", "market"],
+        ).drop_duplicates("ticker")
     df["source"] = df["market"].map(source)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(csv, index=False)
@@ -196,13 +206,17 @@ def load_universe(force_refresh: bool = False,
 
 
 # ---------------------------------------------------------------------------
-# RRSP-wide universe: every common equity on CRA designated exchanges.
-# Yahoo's equity screener is paginated 250/page and returns marketCap,
-# avg volume and quoteType inline, so junk is dropped before the
-# (expensive) history download.
+# Wide universe: every common equity on CRA designated exchanges (plus NSE
+# when india=True). Yahoo's equity screener is paginated 250/page and
+# returns marketCap, avg volume and quoteType inline, so junk is dropped
+# before the (expensive) history download.
 # ---------------------------------------------------------------------------
 
-_RRSP_EXCHANGES = {"US": ["NYQ", "NMS", "ASE"], "CA": ["TOR", "VAN"]}
+_RRSP_EXCHANGES = {
+    "US": ["NYQ", "NMS", "ASE"],
+    "CA": ["TOR", "VAN"],
+    "IN": ["NSI"],          # NSE; BSE adds mostly illiquid microcap dupes
+}
 _BAD_NAME = re.compile(
     r"(?i)(warrant|preferred|preference|autocallable|debenture|"
     r"subordinated|notes? due|structured|rate reset|etn\b|etf\b)")
@@ -210,8 +224,14 @@ _BAD_NAME = re.compile(
 # -UN is a REIT unit worth keeping and -U a USD-settled line).
 _BAD_SYM_US = re.compile(r"-(P[A-Z]*|W[TS]?|R|U)$")
 _BAD_SYM_CA = re.compile(r"-(P[A-Z]*|W[TS]?|R)\.TO$")
-RRSP_MIN_MCAP = 50e6          # sub-$50M names can't carry the model's math
-RRSP_MIN_DOLLAR_VOL = 250e3   # ~$250K/day; the model's own floor is stricter
+_BAD_SYM_IN = re.compile(r"-(W[TS]?|R)\.NS$")
+# Investability floors, in each market's listing currency (~$50M mcap,
+# ~$250K/day for US/CA; ~Rs.400cr / ~Rs.2cr for India).
+_FLOORS = {
+    "US": (50e6, 250e3),
+    "CA": (50e6, 250e3),
+    "IN": (4e9, 20e6),
+}
 
 
 def _rrsp_page(exchanges: list[str], offset: int) -> dict:
@@ -230,7 +250,8 @@ def _rrsp_page(exchanges: list[str], offset: int) -> dict:
 
 def fetch_rrsp_market(market: str) -> list[str]:
     """All investable common equities/ADRs/REITs on one country's exchanges."""
-    bad_sym = _BAD_SYM_CA if market == "CA" else _BAD_SYM_US
+    bad_sym = {"CA": _BAD_SYM_CA, "IN": _BAD_SYM_IN}.get(market, _BAD_SYM_US)
+    min_mcap, min_dv = _FLOORS[market]
     out, offset, total = [], 0, 1
     while offset < total:
         resp = _rrsp_page(_RRSP_EXCHANGES[market], offset)
@@ -245,13 +266,14 @@ def fetch_rrsp_market(market: str) -> list[str]:
                 continue
             if _BAD_NAME.search(name) or bad_sym.search(sym):
                 continue
-            if (q.get("marketCap") or 0) < RRSP_MIN_MCAP:
+            if (q.get("marketCap") or 0) < min_mcap:
                 continue
             dv = (q.get("averageDailyVolume3Month") or 0) * \
                 (q.get("regularMarketPrice") or 0)
-            if dv < RRSP_MIN_DOLLAR_VOL:
+            if dv < min_dv:
                 continue
             out.append(sym)
         offset += len(quotes)
         time.sleep(0.4)
     return out
+

@@ -34,13 +34,16 @@ CHUNK = 100
 
 
 def normalize_symbol(s: str) -> str:
-    """DFN TO -> DFN.TO; BBD.B.TO -> BBD-B.TO; BRK.B -> BRK-B (Yahoo style)."""
-    s = re.sub(r"\s+TO$", ".TO", s.strip().upper())
-    if s.endswith(".TO"):
-        s = s[:-3].replace(".", "-") + ".TO"
-    else:
-        s = s.replace(".", "-")
-    return s
+    """DFN TO -> DFN.TO; BBD.B.TO -> BBD-B.TO; BRK.B -> BRK-B (Yahoo style).
+
+    Known exchange suffixes (.TO/.V/.NS/.BO) are preserved while share-class
+    dots in the base become dashes.
+    """
+    s = re.sub(r"\s+(TO|NS|BO|V)$", r".\1", s.strip().upper())
+    for sfx in (".TO", ".V", ".NS", ".BO"):
+        if s.endswith(sfx):
+            return s[: -len(sfx)].replace(".", "-") + sfx
+    return s.replace(".", "-")
 
 
 def _fresh_session():
